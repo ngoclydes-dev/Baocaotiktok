@@ -1,0 +1,42 @@
+name: TikTok Stats Report (Telegram only)
+
+on:
+  schedule:
+    # 8:00 sáng giờ Việt Nam (UTC+7) = 1:00 UTC
+    - cron: "0 1 * * *"
+  workflow_dispatch: {}   # cho phép bấm chạy tay trên GitHub
+
+permissions:
+  contents: write   # cần quyền ghi để commit lại file trạng thái
+
+jobs:
+  run-tiktok-stats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run TikTok stats script
+        env:
+          TIKTOK_CLIENT_KEY: ${{ secrets.TIKTOK_CLIENT_KEY }}
+          TIKTOK_CLIENT_SECRET: ${{ secrets.TIKTOK_CLIENT_SECRET }}
+          TIKTOK_REFRESH_TOKEN: ${{ secrets.TIKTOK_REFRESH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python tiktok_stats_to_telegram.py
+
+      - name: Commit updated state file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add tiktok_state.json
+          git diff --quiet --cached || git commit -m "Update TikTok state [skip ci]"
+          git push
