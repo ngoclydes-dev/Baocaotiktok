@@ -1,12 +1,12 @@
 """
-TikTok Stats -> Telegram Report (Daily + End of Month)
-=========================================================
-Chỉ báo cáo qua Telegram, không ghi Google Sheet.
-Trạng thái (số liệu hôm qua, tăng trưởng lũy kế trong tháng) được lưu
-trong file JSON nhỏ (tiktok_state.json) ngay trong repo, được commit
-lại sau mỗi lần chạy (xem bước "Commit state file" trong workflow).
+TikTok Stats -> Telegram Report
+==================================
+Chạy 1 lần/ngày. Mỗi lần chạy gửi 1 tin nhắn Telegram gồm 2 phần:
+  1. Tăng trưởng của "hôm qua" (so với lần chạy gần nhất trước đó)
+  2. Lũy kế từ đầu tháng đến hôm qua (chỉ tính video đăng trong tháng)
 
-Chỉ tính các video ĐĂNG TRONG THÁNG HIỆN TẠI.
+Trạng thái (số liệu hôm qua, danh sách video đã biết) lưu trong file
+tiktok_state.json ngay trong repo, được commit lại sau mỗi lần chạy.
 
 Yêu cầu biến môi trường (đặt trong GitHub Secrets):
   TIKTOK_CLIENT_KEY
@@ -18,7 +18,6 @@ Yêu cầu biến môi trường (đặt trong GitHub Secrets):
 
 import os
 import json
-import calendar
 import requests
 from datetime import datetime, timezone, timedelta
 
@@ -128,7 +127,6 @@ def send_telegram_message(text):
         data={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
-            "parse_mode": "Markdown",
             "disable_web_page_preview": True,
         },
         timeout=30,
@@ -136,37 +134,22 @@ def send_telegram_message(text):
     resp.raise_for_status()
 
 
-def build_daily_report(today_str, totals, deltas, video_count, top_video, month_label):
+def build_report(yesterday_str, new_video_count, deltas,
+                  month_start_str, month_end_str,
+                  month_video_count, month_totals):
     lines = [
-        f"📊 *Báo cáo TikTok ngày {today_str}*",
-        f"_(chỉ tính video đăng trong tháng {month_label})_",
-        "",
-        f"🎬 Số video đăng trong tháng: {video_count}",
-        f"👁 Tổng views hiện tại: {totals['views']:,}",
-        f"❤️ Tổng likes hiện tại: {totals['likes']:,}",
-        "",
-        "📈 *Tăng trưởng trong ngày:*",
+        f"📊 Báo cáo TikTok tăng trưởng trong ngày hôm qua {yesterday_str}",
+        f"🎬 Số video đăng mới: {new_video_count}",
         f"👁 Views: +{deltas['views']:,}",
         f"❤️ Likes: +{deltas['likes']:,}",
         f"💬 Comments: +{deltas['comments']:,}",
         f"🔁 Shares: +{deltas['shares']:,}",
-    ]
-    if top_video and top_video["delta_views"] > 0:
-        lines += ["", "🔥 Video tăng views mạnh nhất hôm nay:"]
-        link = top_video.get("share_url", "")
-        lines.append(f"+{top_video['delta_views']:,} views" + (f" — {link}" if link else ""))
-    return "\n".join(lines)
-
-
-def build_monthly_report(month_label, month_growth, video_count):
-    lines = [
-        f"🗓 *Tổng kết TikTok tháng {month_label}*",
-        "",
-        f"🎬 Số video đã đăng trong tháng: {video_count}",
-        f"👁 Views tăng trong tháng: +{month_growth['views']:,}",
-        f"❤️ Likes tăng trong tháng: +{month_growth['likes']:,}",
-        f"💬 Comments tăng trong tháng: +{month_growth['comments']:,}",
-        f"🔁 Shares tăng trong tháng: +{month_growth['shares']:,}",
+        "---------------------------",
+        f"📊 Báo cáo TikTok Trong tháng từ ngày {month_start_str} đến ngày {month_end_str}",
+        f"🎬 Số video đăng trong tháng: {month_video_count}",
+        f"👁 Tổng views hiện tại: {month_totals['views']:,}",
+        f"❤️ Tổng likes hiện tại: {month_totals['likes']:,}",
+        f"🔁 Tổng lượt Shares: +{month_totals['shares']:,}",
     ]
     return "\n".join(lines)
 
@@ -176,9 +159,12 @@ def build_monthly_report(month_label, month_growth, video_count):
 # ----------------------------
 def main():
     now = datetime.now(VN_TZ)
+    yesterday = now - timedelta(days=1)
     today_str = now.strftime("%Y-%m-%d")
+    yesterday_str = yesterday.strftime("%d/%m/%Y")
     month_key = now.strftime("%Y-%m")
-    month_label = now.strftime("%m/%Y")
+    month_start_str = now.replace(day=1).strftime("%d/%m/%Y")
+    month_end_str = yesterday_str  # lũy kế tính đến hết hôm qua
 
     print("Đang refresh access token...")
     access_token = refresh_access_token()
@@ -192,15 +178,15 @@ def main():
         v for v in all_videos
         if datetime.fromtimestamp(v["create_time"], tz=VN_TZ).strftime("%Y-%m") == month_key
     ]
-    print(f"Trong đó {len(videos)} video đăng trong tháng {month_label}.")
+    print(f"Trong đó {len(videos)} video đăng trong tháng {now.strftime('%m/%Y')}.")
 
-    current_totals = {
+    month_totals = {
         "views": sum(v.get("view_count", 0) for v in videos),
         "likes": sum(v.get("like_count", 0) for v in videos),
         "comments": sum(v.get("comment_count", 0) for v in videos),
         "shares": sum(v.get("share_count", 0) for v in videos),
     }
-    current_video_views = {str(v["id"]): v.get("view_count", 0) for v in videos}
+    current_video_ids = {str(v["id"]) for v in videos}
 
     # --- Load state, reset nếu sang tháng mới ---
     state = load_state()
@@ -209,52 +195,36 @@ def main():
             "month": month_key,
             "date": None,
             "totals": empty_totals(),
-            "month_growth": empty_totals(),
-            "video_prev_views": {},
+            "known_video_ids": [],
         }
 
-    # --- Tính tăng trưởng trong ngày ---
+    # --- Tính tăng trưởng "hôm qua" (so với lần chạy trước) ---
     if state["date"] == today_str:
-        # Đã chạy hôm nay rồi, không cộng dồn lần nữa
+        # Đã chạy hôm nay rồi, không tính trùng
         deltas = empty_totals()
+        new_video_count = 0
     else:
         deltas = {
-            k: max(current_totals[k] - state["totals"].get(k, 0), 0)
-            for k in current_totals
+            k: max(month_totals[k] - state["totals"].get(k, 0), 0)
+            for k in month_totals
         }
-        for k in state["month_growth"]:
-            state["month_growth"][k] += deltas[k]
-
-    # --- Video tăng views mạnh nhất hôm nay ---
-    top_video = None
-    best_delta = -1
-    for v in videos:
-        vid = str(v["id"])
-        prev_views = state["video_prev_views"].get(vid, v.get("view_count", 0))
-        delta_v = v.get("view_count", 0) - prev_views
-        if delta_v > best_delta:
-            best_delta = delta_v
-            top_video = {**v, "delta_views": delta_v}
+        known_ids = set(state.get("known_video_ids", []))
+        new_video_count = len(current_video_ids - known_ids)
 
     # --- Cập nhật state ---
     state["date"] = today_str
-    state["totals"] = current_totals
-    state["video_prev_views"] = current_video_views
+    state["totals"] = month_totals
+    state["known_video_ids"] = list(current_video_ids)
     save_state(state)
 
-    # --- Gửi báo cáo ngày ---
-    print("Đang gửi báo cáo ngày qua Telegram...")
-    daily_report = build_daily_report(
-        today_str, current_totals, deltas, len(videos), top_video, month_label
+    # --- Gửi báo cáo ---
+    print("Đang gửi báo cáo qua Telegram...")
+    report = build_report(
+        yesterday_str, new_video_count, deltas,
+        month_start_str, month_end_str,
+        len(videos), month_totals,
     )
-    send_telegram_message(daily_report)
-
-    # --- Nếu là ngày cuối tháng -> gửi thêm báo cáo tổng kết tháng ---
-    last_day_of_month = calendar.monthrange(now.year, now.month)[1]
-    if now.day == last_day_of_month:
-        print("Hôm nay là ngày cuối tháng, đang gửi báo cáo tổng kết...")
-        monthly_report = build_monthly_report(month_label, state["month_growth"], len(videos))
-        send_telegram_message(monthly_report)
+    send_telegram_message(report)
 
     print("Hoàn tất.")
 
