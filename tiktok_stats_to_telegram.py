@@ -1,17 +1,17 @@
 """
-TikTok Stats -> Telegram Report
-==================================
-Chạy 1 lần/ngày. Mỗi lần chạy gửi 1 tin nhắn Telegram gồm 2 phần:
-  1. Tăng trưởng của "hôm qua" (so với lần chạy gần nhất trước đó)
-  2. Lũy kế từ đầu tháng đến hôm qua (chỉ tính video đăng trong tháng)
+TikTok Stats (nhiều tài khoản) -> Telegram Report
+====================================================
+Chạy 1 lần/ngày. Với mỗi tài khoản TikTok trong TIKTOK_ACCOUNTS,
+lấy số liệu, tính tăng trưởng "hôm qua" + lũy kế trong tháng,
+rồi gửi 1 tin nhắn Telegram gồm: từng tài khoản + tổng cộng tất cả.
 
-Trạng thái (số liệu hôm qua, danh sách video đã biết) lưu trong file
-tiktok_state.json ngay trong repo, được commit lại sau mỗi lần chạy.
+Trạng thái lưu trong file tiktok_state.json (1 file, nhiều tài khoản
+bên trong), được commit lại sau mỗi lần chạy.
 
 Yêu cầu biến môi trường (đặt trong GitHub Secrets):
   TIKTOK_CLIENT_KEY
   TIKTOK_CLIENT_SECRET
-  TIKTOK_REFRESH_TOKEN
+  TIKTOK_ACCOUNTS       (JSON: [{"name": "...", "refresh_token": "..."}, ...])
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
 """
@@ -26,7 +26,7 @@ from datetime import datetime, timezone, timedelta
 # ----------------------------
 TIKTOK_CLIENT_KEY = os.environ["TIKTOK_CLIENT_KEY"]
 TIKTOK_CLIENT_SECRET = os.environ["TIKTOK_CLIENT_SECRET"]
-TIKTOK_REFRESH_TOKEN = os.environ["TIKTOK_REFRESH_TOKEN"]
+TIKTOK_ACCOUNTS = json.loads(os.environ["TIKTOK_ACCOUNTS"])  # [{"name","refresh_token"}, ...]
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -38,7 +38,7 @@ STATE_FILE = "tiktok_state.json"
 # ----------------------------
 # 1. TikTok: refresh token + lấy danh sách video
 # ----------------------------
-def refresh_access_token():
+def refresh_access_token(refresh_token):
     resp = requests.post(
         "https://open.tiktokapis.com/v2/oauth/token/",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -46,7 +46,7 @@ def refresh_access_token():
             "client_key": TIKTOK_CLIENT_KEY,
             "client_secret": TIKTOK_CLIENT_SECRET,
             "grant_type": "refresh_token",
-            "refresh_token": TIKTOK_REFRESH_TOKEN,
+            "refresh_token": refresh_token,
         },
         timeout=30,
     )
@@ -100,11 +100,11 @@ def get_all_videos(access_token, max_count=20):
 
 
 # ----------------------------
-# 2. State file (thay cho Google Sheet)
+# 2. State file (nhiều tài khoản trong 1 file)
 # ----------------------------
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return None
+        return {}
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -118,8 +118,69 @@ def empty_totals():
     return {"views": 0, "likes": 0, "comments": 0, "shares": 0}
 
 
+def empty_account_state(month_key):
+    return {
+        "month": month_key,
+        "date": None,
+        "totals": empty_totals(),
+        "known_video_ids": [],
+    }
+
+
 # ----------------------------
-# 3. Telegram
+# 3. Xử lý số liệu 1 tài khoản
+# ----------------------------
+def process_account(account, all_state, now, month_key, today_str):
+    name = account["name"]
+    refresh_token = account["refresh_token"]
+
+    access_token = refresh_access_token(refresh_token)
+    all_videos = get_all_videos(access_token)
+
+    videos = [
+        v for v in all_videos
+        if datetime.fromtimestamp(v["create_time"], tz=VN_TZ).strftime("%Y-%m") == month_key
+    ]
+
+    month_totals = {
+        "views": sum(v.get("view_count", 0) for v in videos),
+        "likes": sum(v.get("like_count", 0) for v in videos),
+        "comments": sum(v.get("comment_count", 0) for v in videos),
+        "shares": sum(v.get("share_count", 0) for v in videos),
+    }
+    current_video_ids = {str(v["id"]) for v in videos}
+
+    acc_state = all_state.get(name)
+    if not acc_state or acc_state.get("month") != month_key:
+        acc_state = empty_account_state(month_key)
+
+    if acc_state["date"] == today_str:
+        deltas = empty_totals()
+        new_video_count = 0
+    else:
+        deltas = {
+            k: max(month_totals[k] - acc_state["totals"].get(k, 0), 0)
+            for k in month_totals
+        }
+        known_ids = set(acc_state.get("known_video_ids", []))
+        new_video_count = len(current_video_ids - known_ids)
+
+    acc_state["date"] = today_str
+    acc_state["totals"] = month_totals
+    acc_state["known_video_ids"] = list(current_video_ids)
+    all_state[name] = acc_state
+
+    return {
+        "name": name,
+        "video_count": len(videos),
+        "new_video_count": new_video_count,
+        "deltas": deltas,
+        "month_totals": month_totals,
+    }
+
+
+# ----------------------------
+# 4. Telegram
 # ----------------------------
 def send_telegram_message(text):
     resp = requests.post(
@@ -134,23 +195,48 @@ def send_telegram_message(text):
     resp.raise_for_status()
 
 
-def build_report(yesterday_str, new_video_count, deltas,
-                  month_start_str, month_end_str,
-                  month_video_count, month_totals):
-    lines = [
-        f"📊 Báo cáo TikTok tăng trưởng trong ngày hôm qua {yesterday_str}",
-        f"🎬 Số video đăng mới: {new_video_count}",
-        f"👁 Views: +{deltas['views']:,}",
-        f"❤️ Likes: +{deltas['likes']:,}",
-        f"💬 Comments: +{deltas['comments']:,}",
-        f"🔁 Shares: +{deltas['shares']:,}",
-        "---------------------------",
-        f"📊 Báo cáo TikTok Trong tháng từ ngày {month_start_str} đến ngày {month_end_str}",
-        f"🎬 Số video đăng trong tháng: {month_video_count}",
-        f"👁 Tổng views hiện tại: {month_totals['views']:,}",
-        f"❤️ Tổng likes hiện tại: {month_totals['likes']:,}",
-        f"🔁 Tổng lượt Shares: +{month_totals['shares']:,}",
-    ]
+def build_report(yesterday_str, month_start_str, month_end_str, account_results):
+    lines = [f"📊 BÁO CÁO TIKTOK — {yesterday_str}", ""]
+
+    total_new_videos = 0
+    total_deltas = empty_totals()
+    total_month_videos = 0
+    total_month = empty_totals()
+
+    for r in account_results:
+        lines.append(f"🏢 {r['name']}")
+        lines.append(f"— Tăng trưởng hôm qua {yesterday_str} —")
+        lines.append(f"🎬 Video đăng mới: {r['new_video_count']}")
+        lines.append(f"👁 Views: +{r['deltas']['views']:,}")
+        lines.append(f"❤️ Likes: +{r['deltas']['likes']:,}")
+        lines.append(f"💬 Comments: +{r['deltas']['comments']:,}")
+        lines.append(f"🔁 Shares: +{r['deltas']['shares']:,}")
+        lines.append(f"— Lũy kế tháng ({month_start_str} - {month_end_str}) —")
+        lines.append(f"🎬 Số video trong tháng: {r['video_count']}")
+        lines.append(f"👁 Tổng views: {r['month_totals']['views']:,}")
+        lines.append(f"❤️ Tổng likes: {r['month_totals']['likes']:,}")
+        lines.append(f"🔁 Tổng shares: +{r['month_totals']['shares']:,}")
+        lines.append("---------------------------")
+
+        total_new_videos += r["new_video_count"]
+        total_month_videos += r["video_count"]
+        for k in total_deltas:
+            total_deltas[k] += r["deltas"][k]
+            total_month[k] += r["month_totals"][k]
+
+    lines.append("📌 TỔNG CỘNG TẤT CẢ TÀI KHOẢN")
+    lines.append(f"— Tăng trưởng hôm qua {yesterday_str} —")
+    lines.append(f"🎬 Video đăng mới: {total_new_videos}")
+    lines.append(f"👁 Views: +{total_deltas['views']:,}")
+    lines.append(f"❤️ Likes: +{total_deltas['likes']:,}")
+    lines.append(f"💬 Comments: +{total_deltas['comments']:,}")
+    lines.append(f"🔁 Shares: +{total_deltas['shares']:,}")
+    lines.append(f"— Lũy kế tháng ({month_start_str} - {month_end_str}) —")
+    lines.append(f"🎬 Số video trong tháng: {total_month_videos}")
+    lines.append(f"👁 Tổng views: {total_month['views']:,}")
+    lines.append(f"❤️ Tổng likes: {total_month['likes']:,}")
+    lines.append(f"🔁 Tổng shares: +{total_month['shares']:,}")
+
     return "\n".join(lines)
 
 
@@ -164,66 +250,28 @@ def main():
     yesterday_str = yesterday.strftime("%d/%m/%Y")
     month_key = now.strftime("%Y-%m")
     month_start_str = now.replace(day=1).strftime("%d/%m/%Y")
-    month_end_str = yesterday_str  # lũy kế tính đến hết hôm qua
+    month_end_str = yesterday_str
 
-    print("Đang refresh access token...")
-    access_token = refresh_access_token()
+    all_state = load_state()
+    account_results = []
 
-    print("Đang lấy danh sách video...")
-    all_videos = get_all_videos(access_token)
-    print(f"Lấy được {len(all_videos)} video (tất cả thời gian).")
+    for account in TIKTOK_ACCOUNTS:
+        print(f"Đang xử lý tài khoản: {account['name']}...")
+        try:
+            result = process_account(account, all_state, now, month_key, today_str)
+            account_results.append(result)
+        except Exception as e:
+            print(f"Lỗi khi xử lý tài khoản {account['name']}: {e}")
+            # Không dừng toàn bộ script nếu 1 tài khoản lỗi, tiếp tục các tài khoản khác
+            continue
 
-    # --- Chỉ giữ video đăng trong tháng hiện tại ---
-    videos = [
-        v for v in all_videos
-        if datetime.fromtimestamp(v["create_time"], tz=VN_TZ).strftime("%Y-%m") == month_key
-    ]
-    print(f"Trong đó {len(videos)} video đăng trong tháng {now.strftime('%m/%Y')}.")
+    save_state(all_state)
 
-    month_totals = {
-        "views": sum(v.get("view_count", 0) for v in videos),
-        "likes": sum(v.get("like_count", 0) for v in videos),
-        "comments": sum(v.get("comment_count", 0) for v in videos),
-        "shares": sum(v.get("share_count", 0) for v in videos),
-    }
-    current_video_ids = {str(v["id"]) for v in videos}
+    if not account_results:
+        raise RuntimeError("Không xử lý được tài khoản nào, dừng lại không gửi báo cáo.")
 
-    # --- Load state, reset nếu sang tháng mới ---
-    state = load_state()
-    if not state or state.get("month") != month_key:
-        state = {
-            "month": month_key,
-            "date": None,
-            "totals": empty_totals(),
-            "known_video_ids": [],
-        }
-
-    # --- Tính tăng trưởng "hôm qua" (so với lần chạy trước) ---
-    if state["date"] == today_str:
-        # Đã chạy hôm nay rồi, không tính trùng
-        deltas = empty_totals()
-        new_video_count = 0
-    else:
-        deltas = {
-            k: max(month_totals[k] - state["totals"].get(k, 0), 0)
-            for k in month_totals
-        }
-        known_ids = set(state.get("known_video_ids", []))
-        new_video_count = len(current_video_ids - known_ids)
-
-    # --- Cập nhật state ---
-    state["date"] = today_str
-    state["totals"] = month_totals
-    state["known_video_ids"] = list(current_video_ids)
-    save_state(state)
-
-    # --- Gửi báo cáo ---
     print("Đang gửi báo cáo qua Telegram...")
-    report = build_report(
-        yesterday_str, new_video_count, deltas,
-        month_start_str, month_end_str,
-        len(videos), month_totals,
-    )
+    report = build_report(yesterday_str, month_start_str, month_end_str, account_results)
     send_telegram_message(report)
 
     print("Hoàn tất.")
