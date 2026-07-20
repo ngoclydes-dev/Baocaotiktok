@@ -182,17 +182,40 @@ def process_account(account, all_state, now, month_key, today_str):
 # ----------------------------
 # 4. Telegram
 # ----------------------------
+TELEGRAM_MAX_LEN = 4000  # để dư an toàn so với giới hạn thật 4096
+
+
 def send_telegram_message(text):
-    resp = requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
+    # Nếu tin nhắn quá dài, chia nhỏ theo từng đoạn (ngăn cách bởi dòng "---")
+    chunks = []
+    if len(text) <= TELEGRAM_MAX_LEN:
+        chunks = [text]
+    else:
+        parts = text.split("---------------------------")
+        buffer = ""
+        for part in parts:
+            candidate = (buffer + "---------------------------" + part) if buffer else part
+            if len(candidate) > TELEGRAM_MAX_LEN and buffer:
+                chunks.append(buffer)
+                buffer = part
+            else:
+                buffer = candidate
+        if buffer:
+            chunks.append(buffer)
+
+    for chunk in chunks:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "disable_web_page_preview": True,
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            print(f"Telegram trả về lỗi: {resp.status_code} - {resp.text}")
+        resp.raise_for_status()
 
 
 def build_report(yesterday_str, month_start_str, month_end_str, account_results):
