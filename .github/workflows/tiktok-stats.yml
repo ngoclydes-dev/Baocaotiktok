@@ -1,11 +1,9 @@
 name: TikTok Stats Report (Telegram only)
 
 on:
-  schedule:
-    # 8:00 sáng giờ Việt Nam (UTC+7) = 1:00 UTC
-    - cron: "0 1 * * *"
   workflow_dispatch: {}   # cho phép bấm chạy tay trên GitHub
-
+  repository_dispatch:
+    types: [run-tiktok-report]
 permissions:
   contents: write   # cần quyền ghi để commit lại file trạng thái
 
