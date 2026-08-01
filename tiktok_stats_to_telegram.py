@@ -137,18 +137,20 @@ def process_account(account, all_state, now, month_key, today_str):
     access_token = refresh_access_token(refresh_token)
     all_videos = get_all_videos(access_token)
 
-    videos = [
+    # Video đăng trong tháng hiện tại — chỉ dùng để đếm số lượng, KHÔNG dùng để giới hạn views/likes/...
+    month_videos = [
         v for v in all_videos
         if datetime.fromtimestamp(v["create_time"], tz=VN_TZ).strftime("%Y-%m") == month_key
     ]
 
-    month_totals = {
-        "views": sum(v.get("view_count", 0) for v in videos),
-        "likes": sum(v.get("like_count", 0) for v in videos),
-        "comments": sum(v.get("comment_count", 0) for v in videos),
-        "shares": sum(v.get("share_count", 0) for v in videos),
+    # Views/Likes/Comments/Shares tính trên TOÀN BỘ video của kênh (từ trước đến giờ)
+    channel_totals = {
+        "views": sum(v.get("view_count", 0) for v in all_videos),
+        "likes": sum(v.get("like_count", 0) for v in all_videos),
+        "comments": sum(v.get("comment_count", 0) for v in all_videos),
+        "shares": sum(v.get("share_count", 0) for v in all_videos),
     }
-    current_video_ids = {str(v["id"]) for v in videos}
+    current_video_ids = {str(v["id"]) for v in all_videos}
 
     acc_state = all_state.get(name)
     if not acc_state or acc_state.get("month") != month_key:
@@ -159,23 +161,23 @@ def process_account(account, all_state, now, month_key, today_str):
         new_video_count = 0
     else:
         deltas = {
-            k: max(month_totals[k] - acc_state["totals"].get(k, 0), 0)
-            for k in month_totals
+            k: max(channel_totals[k] - acc_state["totals"].get(k, 0), 0)
+            for k in channel_totals
         }
         known_ids = set(acc_state.get("known_video_ids", []))
         new_video_count = len(current_video_ids - known_ids)
 
     acc_state["date"] = today_str
-    acc_state["totals"] = month_totals
+    acc_state["totals"] = channel_totals
     acc_state["known_video_ids"] = list(current_video_ids)
     all_state[name] = acc_state
 
     return {
         "name": name,
-        "video_count": len(videos),
+        "video_count": len(month_videos),
         "new_video_count": new_video_count,
         "deltas": deltas,
-        "month_totals": month_totals,
+        "month_totals": channel_totals,
     }
 
 
@@ -271,8 +273,11 @@ def main():
     yesterday = now - timedelta(days=1)
     today_str = now.strftime("%Y-%m-%d")
     yesterday_str = yesterday.strftime("%d/%m/%Y")
-    month_key = now.strftime("%Y-%m")
-    month_start_str = now.replace(day=1).strftime("%d/%m/%Y")
+    # Dùng tháng của "hôm qua" làm mốc tính toán, vì báo cáo này luôn nói về hôm qua.
+    # Nhờ vậy vào ngày 1 đầu tháng, báo cáo sẽ tổng kết trọn vẹn tháng vừa qua
+    # thay vì bị lệch giữa "tháng đang lọc" và "ngày hiển thị".
+    month_key = yesterday.strftime("%Y-%m")
+    month_start_str = yesterday.replace(day=1).strftime("%d/%m/%Y")
     month_end_str = yesterday_str
 
     all_state = load_state()
